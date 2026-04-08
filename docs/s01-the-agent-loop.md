@@ -29,68 +29,85 @@
 
 1. 用户 prompt 作为第一条消息。
 
-<!-- ```python
-messages.append({"role": "user", "content": query})
-``` -->
-
-2. 将消息和工具定义一起发给 LLM。
-
-<!-- ```python
-response = client.messages.create(
-    model=MODEL, system=SYSTEM, messages=messages,
-    tools=TOOLS, max_tokens=8000,
-)
-``` -->
-
-3. 追加助手响应。检查 `stop_reason` -- 如果模型没有调用工具, 结束。
-
-<!-- ```python
-messages.append({"role": "assistant", "content": response.content})
-if response.stop_reason != "tool_use":
-    return -->
+```rust
+history.push(json!({ "role": "user", "content": query}));
 ```
 
-4. 执行每个工具调用, 收集结果, 作为 user 消息追加。回到第 2 步。
+1. 将消息和工具定义一起发给 LLM。
 
-<!-- ```python
-results = []
-for block in response.content:
-    if block.type == "tool_use":
-        output = run_bash(block.input["command"])
-        results.append({
-            "type": "tool_result",
-            "tool_use_id": block.id,
-            "content": output,
-        })
-messages.append({"role": "user", "content": results})
-``` -->
+```rust
+let resp = client
+    .post(format!("{}/v1/chat/completions", base_url))
+    .json(&json!({
+        "model": model_id,
+        "messages": full_messages,
+        "tools": TOOLS,
+        "max_tokens": 8000
+    }))
+    .send()
+    .await?
+    .json::<Value>()
+    .await?;
+```
+
+1. 追加助手响应。检查 `finish_reason` -- 如果模型没有调用工具, 结束。
+
+```rust
+let message = &resp["choices"][0]["message"];
+let finish_reason = resp["choices"][0]["finish_reason"].as_str().unwrap_or("");
+messages.push(message.clone());
+
+if finish_reason != "tool_calls" {
+    return Ok(());
+}
+```
+
+1. 执行每个工具调用, 收集结果, 逐条追加到历史。回到第 2 步。
+
+```rust
+let mut results: Vec<Value> = vec![];
+if let Some(tool_calls) = message["tool_calls"].as_array() {
+    for tc in tool_calls {
+        let args: Value = serde_json::from_str(tc["function"]["arguments"].as_str().unwrap_or("{}")).unwrap();
+        let command = args["command"].as_str().unwrap_or("");
+        let output = run_bash(command);
+        results.push(json!({
+            "role": "tool",
+            "tool_call_id": tc["id"],
+            "content": output
+        }));
+    }
+}
+messages.extend(results);
+```
 
 组装为一个完整函数:
 
-<!-- ```python
-def agent_loop(query):
-    messages = [{"role": "user", "content": query}]
-    while True:
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages,
-            tools=TOOLS, max_tokens=8000,
-        )
-        messages.append({"role": "assistant", "content": response.content})
+```rust
+async fn agent_loop(
+  client: &Client,
+  messages: &mut Vec<Value>,
+) -> Result<(), Box<dyn std::error::Error>> {
+  loop {
+    let resp = client.post(URL).json(&body).send().await?.json::<Value>().await?;
+    let message = &resp["choices"][0]["message"];
+    let finish_reason = resp["choices"][0]["finish_reason"].as_str().unwrap_or("");
+    messages.push(message.clone());
 
-        if response.stop_reason != "tool_use":
-            return
+    if finish_reason != "tool_calls" { return Ok(()); }
 
-        results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                output = run_bash(block.input["command"])
-                results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": output,
-                })
-        messages.append({"role": "user", "content": results})
-``` -->
+    let mut results: Vec<Value> = vec![];
+    if let Some(tool_calls) = message["tool_calls"].as_array() {
+      for tc in tool_calls {
+        let args: Value = serde_json::from_str(tc["function"]["arguments"].as_str().unwrap_or("{}"))?;
+        let output = run_bash(args["command"].as_str().unwrap_or(""));
+        results.push(json!({"role": "tool", "tool_call_id": tc["id"], "content": output}));
+      }
+    }
+    messages.extend(results);
+  }
+}
+```
 
 不到 30 行, 这就是整个 Agent。后面 11 个章节都在这个循环上叠加机制 -- 循环本身始终不变。
 
@@ -98,16 +115,16 @@ def agent_loop(query):
 
 | 组件          | 之前       | 之后                           |
 |---------------|------------|--------------------------------|
-| Agent loop    | (无)       | `while True` + stop_reason     |
+| Agent loop    | (无)       | `loop` + finish_reason         |
 | Tools         | (无)       | `bash` (单一工具)              |
-| Messages      | (无)       | 累积式消息列表                 |
-| Control flow  | (无)       | `stop_reason != "tool_use"`    |
+| Messages      | (无)       | 累积式消息列表 (`Vec<Value>`)  |
+| Control flow  | (无)       | `finish_reason != "tool_calls"`|
 
 ## 试一试
 
 ```sh
-# cd learn-claude-code
-# python agents/s01_agent_loop.py
+# cd learn-claude-code-rust
+cargo run --bin s01
 ```
 
 试试这些 prompt (英文 prompt 对 LLM 效果更好, 也可以用中文):

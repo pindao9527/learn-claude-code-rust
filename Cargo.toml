@@ -1,0 +1,22 @@
+[package]
+name = "learn-claude-code-rust"
+version = "0.1.0"
+edition = "2024"
+
+# 1. 定义二进制入口 (Binary Definition)
+[[bin]]
+# 因为 s01_agent_loop.rs 不在 src/ 目录下，必须手动告诉 Cargo 哪里可以找到它
+name = "s01"
+path = "agents/s01_agent_loop.rs"
+
+
+# 2. 项目依赖 (Dependencies)
+[dependencies]
+# 异步运行时，提供 #[tokio::main] 和异步执行环境
+tokio = { version = "1", features = ["full"] }
+# 网络请求库，用于调用 LLM API
+reqwest = { version = "0.11", features = ["json"] }
+# JSON 序列化/反序列化工具，提供 json! 宏
+serde_json = "1.0"
+# 加载 .env 环境变量文件
+dotenv = "0.15"

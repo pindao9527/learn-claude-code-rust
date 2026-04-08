@@ -9,6 +9,10 @@ edition = "2024"
 name = "s01"
 path = "agents/s01_agent_loop.rs"
 
+[[bin]]
+name = "s02"
+path = "agents/s02_tool_use.rs"
+
 
 # 2. 项目依赖 (Dependencies)
 [dependencies]
@@ -20,3 +24,4 @@ reqwest = { version = "0.11", features = ["json"] }
 serde_json = "1.0"
 # 加载 .env 环境变量文件
 dotenv = "0.15"
+serde = { version = "1.0.228", features = ["derive"] }

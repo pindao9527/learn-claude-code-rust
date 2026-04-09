@@ -13,6 +13,10 @@ path = "agents/s01_agent_loop.rs"
 name = "s02"
 path = "agents/s02_tool_use.rs"
 
+[[bin]]
+name = "s03"
+path = "agents/s03_todo_write.rs"
+
 
 # 2. 项目依赖 (Dependencies)
 [dependencies]
@@ -25,3 +29,4 @@ serde_json = "1.0"
 # 加载 .env 环境变量文件
 dotenv = "0.15"
 serde = { version = "1.0.228", features = ["derive"] }
+wait-timeout = "0.2"

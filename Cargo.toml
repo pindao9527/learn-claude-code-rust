@@ -17,6 +17,10 @@ path = "agents/s02_tool_use.rs"
 name = "s03"
 path = "agents/s03_todo_write.rs"
 
+[[bin]]
+name = "s04"
+path = "agents/s04_subagent.rs"
+
 
 # 2. 项目依赖 (Dependencies)
 [dependencies]

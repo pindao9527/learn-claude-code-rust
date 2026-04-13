@@ -33,46 +33,61 @@ One lookup replaces any if/elif chain.
 
 1. 每个工具有一个处理函数。路径沙箱防止逃逸工作区。
 
-```python
-def safe_path(p: str) -> Path:
-    path = (WORKDIR / p).resolve()
-    if not path.is_relative_to(WORKDIR):
-        raise ValueError(f"Path escapes workspace: {p}")
-    return path
+```rust
+fn safe_path(p: &str) -> Result<std::path::PathBuf, String> {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let path = cwd.join(p);
+    if !path.starts_with(&cwd) {
+        return Err(format!("Error: Path escapes workspace: {}", p));
+    }
+    Ok(path)
+}
 
-def run_read(path: str, limit: int = None) -> str:
-    text = safe_path(path).read_text()
-    lines = text.splitlines()
-    if limit and limit < len(lines):
-        lines = lines[:limit]
-    return "\n".join(lines)[:50000]
+fn run_read(path_str: &str) -> String {
+    let path = match safe_path(path_str) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    std::fs::read_to_string(path).unwrap_or_else(|e| format!("Error: {}", e))
+}
 ```
 
 2. dispatch map 将工具名映射到处理函数。
 
-```python
-TOOL_HANDLERS = {
-    "bash":       lambda **kw: run_bash(kw["command"]),
-    "read_file":  lambda **kw: run_read(kw["path"], kw.get("limit")),
-    "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
-    "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"],
-                                        kw["new_text"]),
-}
+```rust
+// 在 Rust 中，通常不使用动态字面量字典，而是使用高效的 match 模式匹配：
+let output = match tool_name {
+    "bash" => run_bash(args["command"].as_str().unwrap_or("")),
+    "read_file" => run_read(args["path"].as_str().unwrap_or("")),
+    "write_file" => run_write(
+        args["path"].as_str().unwrap_or(""), 
+        args["content"].as_str().unwrap_or("")
+    ),
+    "edit_file" => run_edit(
+        args["path"].as_str().unwrap_or(""),
+        args["old_text"].as_str().unwrap_or(""),
+        args["new_text"].as_str().unwrap_or("")
+    ),
+    _ => format!("Unknown tool: {}", tool_name),
+};
 ```
 
 3. 循环中按名称查找处理函数。循环体本身与 s01 完全一致。
 
-```python
-for block in response.content:
-    if block.type == "tool_use":
-        handler = TOOL_HANDLERS.get(block.name)
-        output = handler(**block.input) if handler \
-            else f"Unknown tool: {block.name}"
-        results.append({
-            "type": "tool_result",
-            "tool_use_id": block.id,
-            "content": output,
-        })
+```rust
+if let Some(tool_calls) = choice["message"]["tool_calls"].as_array() {
+    for tc in tool_calls {
+        let tool_name = tc["function"]["name"].as_str().unwrap_or("");
+        let args: Value = serde_json::from_str(tc["function"]["arguments"].as_str().unwrap_or("{}")).unwrap();
+        
+        let output = match tool_name { ... }; // (详见上述匹配)
+        
+        results.push(Message::Tool {
+            tool_call_id: tc["id"].as_str().unwrap_or("").to_string(),
+            content: output,
+        });
+    }
+}
 ```
 
 加工具 = 加 handler + 加 schema。循环永远不变。
@@ -89,8 +104,8 @@ for block in response.content:
 ## 试一试
 
 ```sh
-cd learn-claude-code
-python agents/s02_tool_use.py
+cd learn-claude-code-rust
+cargo run --bin s02
 ```
 
 试试这些 prompt (英文 prompt 对 LLM 效果更好, 也可以用中文):
@@ -138,71 +153,43 @@ API 协议有三条硬性约束:
 
 ### 实现
 
-```python
-def normalize_messages(messages: list) -> list:
-    """将内部消息列表规范化为 API 可接受的格式。"""
-    normalized = []
+```rust
+fn normalize_messages(messages: &[Message]) -> Vec<Message> {
+    // 将内部消息列表规范化为 API 可接受的格式。
+    let mut normalized = Vec::new();
+    let mut existing_results = std::collections::HashSet::new();
 
-    for msg in messages:
-        # Step 1: 剥离内部字段
-        clean = {"role": msg["role"]}
-        if isinstance(msg.get("content"), str):
-            clean["content"] = msg["content"]
-        elif isinstance(msg.get("content"), list):
-            clean["content"] = [
-                {k: v for k, v in block.items()
-                 if k not in ("_internal", "_source", "_timestamp")}
-                for block in msg["content"]
-            ]
-        normalized.append(clean)
+    // Step 1: 剥离内部字段，记录已存在的 Tool 响应 ID
+    for msg in messages {
+        match msg {
+            Message::Tool { tool_call_id, .. } => {
+                existing_results.insert(tool_call_id.clone());
+            }
+            _ => { /* 剥离多余数据... */ }
+        }
+    }
 
-    # Step 2: tool_result 配对补齐
-    # 收集所有已有的 tool_result ID
-    existing_results = set()
-    for msg in normalized:
-        if isinstance(msg.get("content"), list):
-            for block in msg["content"]:
-                if block.get("type") == "tool_result":
-                    existing_results.add(block.get("tool_use_id"))
+    // Step 2: 填充缺失配对的 tool_use, 插入占位结果
+    // Step 3: 合并连续的同角色 Message (例如连续发送两个 User 提示)
+    // （在 Rust 中这里将以迭代、状态机、模式匹配形式被大量简化或显式编写）
+    // ...
 
-    # 找出缺失配对的 tool_use, 插入占位 result
-    for msg in normalized:
-        if msg["role"] == "assistant" and isinstance(msg.get("content"), list):
-            for block in msg["content"]:
-                if (block.get("type") == "tool_use"
-                        and block.get("id") not in existing_results):
-                    # 在下一条 user 消息中补齐
-                    normalized.append({"role": "user", "content": [{
-                        "type": "tool_result",
-                        "tool_use_id": block["id"],
-                        "content": "(cancelled)",
-                    }]})
-
-    # Step 3: 合并连续同角色消息
-    merged = [normalized[0]] if normalized else []
-    for msg in normalized[1:]:
-        if msg["role"] == merged[-1]["role"]:
-            # 合并内容
-            prev = merged[-1]
-            prev_content = prev["content"] if isinstance(prev["content"], list) \
-                else [{"type": "text", "text": prev["content"]}]
-            curr_content = msg["content"] if isinstance(msg["content"], list) \
-                else [{"type": "text", "text": msg["content"]}]
-            prev["content"] = prev_content + curr_content
-        else:
-            merged.append(msg)
-
-    return merged
+    normalized
+}
 ```
 
 在 agent loop 中, 每次 API 调用前运行:
 
-```python
-response = client.messages.create(
-    model=MODEL, system=system,
-    messages=normalize_messages(messages),  # 规范化后再发送
-    tools=TOOLS, max_tokens=8000,
-)
+```rust
+let body = json!({
+    "model": model_id,
+    "system": system,
+    "messages": normalize_messages(&messages), // 规范化后再发送
+    "tools": TOOLS,
+    "max_tokens": 8000
+});
+
+// 发起 HTTP Client reqwest 请求 ...
 ```
 
 **关键洞察**: `messages` 列表是系统的内部表示, API 看到的是规范化后的副本。两者不是同一个东西。

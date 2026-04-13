@@ -91,22 +91,25 @@
 
 这还是最基础的结构：
 
-```python
-tool = {
+```rust
+// 通过 serde_json 构造：
+let tool = json!({
     "name": "read_file",
     "description": "Read file contents.",
-    "input_schema": {...},
-}
+    "input_schema": {/* ... */}
+});
 ```
 
 ### 2. ToolDispatchMap
 
-```python
-handlers = {
-    "read_file": read_file,
-    "write_file": write_file,
-    "bash": run_bash,
-}
+```rust
+// 在 Rust 中，不使用字典存储函数指针，通常使用 match 分发：
+// match tool_name {
+//     "read_file" => run_read(...),
+//     "write_file" => run_write(...),
+//     "bash" => run_bash(...),
+//     _ => ...
+// };
 ```
 
 这依旧需要，但它不是全部。
@@ -115,15 +118,14 @@ handlers = {
 
 教学版可以先做一个简化版本：
 
-```python
-tool_use_context = {
-    "tools": handlers,
-    "permission_context": {...},
-    "mcp_clients": {},
-    "messages": [...],
-    "app_state": {...},
-    "notifications": [],
-    "cwd": "...",
+```rust
+pub struct ToolUseContext<'a> {
+    pub permission_context: &'a PermissionContext,
+    pub mcp_clients: &'a HashMap<String, McpClient>,
+    pub messages: &'a mut Vec<Message>,
+    pub app_state: &'a AppState,
+    pub tx_notify: tokio::sync::mpsc::Sender<Notification>,
+    pub cwd: std::path::PathBuf,
 }
 ```
 
@@ -138,13 +140,14 @@ tool_use_context = {
 
 更稳妥的形状是：
 
-```python
-result = {
-    "ok": True,
-    "content": "...",
-    "is_error": False,
-    "attachments": [],
+```rust
+pub struct ToolResultEnvelope {
+    pub ok: bool,
+    pub content: String,
+    pub is_error: bool,
+    pub attachments: Vec<Attachment>,
 }
+// 或者通过 Rust 原生的 Result<ToolOutput, ToolError> 结合上层封装
 ```
 
 这样后面你才能平滑承接：
@@ -160,16 +163,16 @@ result = {
 
 ### 系统 A：只有 dispatch map
 
-```python
-output = handlers[tool_name](**tool_input)
+```rust
+let output = executor.run_tool(tool_name, &tool_input).await;
 ```
 
 这适合最小 demo。
 
 ### 系统 B：有 ToolUseContext
 
-```python
-output = handlers[tool_name](tool_input, tool_use_context)
+```rust
+let output = executor.run_tool(tool_name, &tool_input, &mut context).await;
 ```
 
 这个版本才更接近一个真实平台。
@@ -193,32 +196,44 @@ output = handlers[tool_name](tool_input, tool_use_context)
 
 ### 第二步：引入一个统一 context
 
-```python
-class ToolUseContext:
-    def __init__(self):
-        self.handlers = {}
-        self.permission_context = {}
-        self.mcp_clients = {}
-        self.messages = []
-        self.app_state = {}
-        self.notifications = []
+```rust
+pub struct ToolUseContext {
+    pub permission_context: PermissionContext,
+    pub mcp_clients: HashMap<String, McpClient>,
+    pub messages: Vec<Message>,
+    pub app_state: AppState,
+    pub notifications: Vec<Notification>,
+}
+
+impl ToolUseContext {
+    pub fn new() -> Self {
+        Self { /* ...初始化各个共享组件... */ }
+    }
+}
 ```
 
 ### 第三步：让所有 handler 都能看到 context
 
-```python
-def run_tool(tool_name: str, tool_input: dict, ctx: ToolUseContext):
-    handler = ctx.handlers[tool_name]
-    return handler(tool_input, ctx)
+```rust
+async fn run_tool(tool_name: &str, tool_input: &Value, ctx: &mut ToolUseContext) -> Result<String, ToolError> {
+    match tool_name {
+        "read_file" => run_read_with_ctx(tool_input, ctx).await,
+        "bash" => run_bash_with_ctx(tool_input, ctx).await,
+        _ => Err(ToolError::UnknownTool(tool_name.to_string())),
+    }
+}
 ```
 
 ### 第四步：在 router 层分不同能力来源
 
-```python
-def route_tool(tool_name: str, tool_input: dict, ctx: ToolUseContext):
-    if tool_name.startswith("mcp__"):
-        return run_mcp_tool(tool_name, tool_input, ctx)
-    return run_native_tool(tool_name, tool_input, ctx)
+```rust
+async fn route_tool(tool_name: &str, tool_input: &Value, ctx: &mut ToolUseContext) -> Result<String, ToolError> {
+    if tool_name.starts_with("mcp__") {
+        run_mcp_tool(tool_name, tool_input, ctx).await
+    } else {
+        run_native_tool(tool_name, tool_input, ctx).await
+    }
+}
 ```
 
 ## 一张应该讲清楚的图

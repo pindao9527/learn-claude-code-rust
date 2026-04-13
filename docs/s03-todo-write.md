@@ -114,11 +114,19 @@
 
 最小条目可以长这样：
 
-```python
-{
-    "content": "Read the failing test",
-    "status": "pending" | "in_progress" | "completed",
-    "activeForm": "Reading the failing test",
+```rust
+#[derive(Debug, Serialize, Deserialize)]
+pub enum PlanStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PlanItem {
+    pub content: String,
+    pub status: PlanStatus,
+    pub active_form: Option<String>,
 }
 ```
 
@@ -132,10 +140,10 @@
 
 除了计划条目本身，还应该有一点最小运行状态：
 
-```python
-{
-    "items": [...],
-    "rounds_since_update": 0,
+```rust
+pub struct PlanningState {
+    pub items: Vec<PlanItem>,
+    pub rounds_since_update: u32,
 }
 ```
 
@@ -160,73 +168,87 @@
 
 ### 第一步：准备一个计划管理器
 
-```python
-class TodoManager:
-    def __init__(self):
-        self.items = []
+```rust
+pub struct TodoManager {
+    pub items: Vec<PlanItem>,
+}
+
+impl TodoManager {
+    pub fn new() -> Self {
+        Self { items: Vec::new() }
+    }
 ```
 
 ### 第二步：允许模型整体更新当前计划
 
-```python
-def update(self, items: list) -> str:
-    validated = []
-    in_progress_count = 0
+```rust
+    pub fn update(&mut self, items: Vec<PlanItem>) -> Result<String, String> {
+        let mut in_progress_count = 0;
+        let mut validated = Vec::new();
 
-    for item in items:
-        status = item.get("status", "pending")
-        if status == "in_progress":
-            in_progress_count += 1
-        validated.append({
-            "content": item["content"],
-            "status": status,
-            "activeForm": item.get("activeForm", ""),
-        })
+        for item in items {
+            if matches!(item.status, PlanStatus::InProgress) {
+                in_progress_count += 1;
+            }
+            validated.push(item);
+        }
 
-    if in_progress_count > 1:
-        raise ValueError("Only one item can be in_progress")
+        if in_progress_count > 1 {
+            return Err("Only one item can be in_progress".to_string());
+        }
 
-    self.items = validated
-    return self.render()
+        self.items = validated;
+        Ok(self.render())
+    }
 ```
 
 教学版让模型“整份重写”当前计划，比做一堆局部增删改更容易理解。
 
 ### 第三步：把计划渲染成可读文本
 
-```python
-def render(self) -> str:
-    lines = []
-    for item in self.items:
-        marker = {
-            "pending": "[ ]",
-            "in_progress": "[>]",
-            "completed": "[x]",
-        }[item["status"]]
-        lines.append(f"{marker} {item['content']}")
-    return "\n".join(lines)
+```rust
+    pub fn render(&self) -> String {
+        let mut lines = Vec::new();
+        for item in &self.items {
+            let marker = match item.status {
+                PlanStatus::Pending => "[ ]",
+                PlanStatus::InProgress => "[>]",
+                PlanStatus::Completed => "[x]",
+            };
+            lines.push(format!("{} {}", marker, item.content));
+        }
+        lines.join("\n")
+    }
+}
 ```
 
 ### 第四步：把 `todo` 接成一个工具
 
-```python
-TOOL_HANDLERS = {
-    "read_file": run_read,
-    "write_file": run_write,
-    "edit_file": run_edit,
-    "bash": run_bash,
-    "todo": lambda **kw: TODO.update(kw["items"]),
-}
+```rust
+// match 工具调用时，增加专门的 todo 分支
+let output = match tool_name {
+    "read_file" => run_read(...),
+    // ...
+    "todo" => {
+        let items: Vec<PlanItem> = serde_json::from_value(args["items"].clone()).unwrap_or_default();
+        match todo_manager.update(items) {
+            Ok(s) => s,
+            Err(e) => format!("Error: {}", e),
+        }
+    },
+    _ => format!("Unknown tool: {}", tool_name),
+};
 ```
 
 ### 第五步：如果连续几轮没更新计划，就提醒
 
-```python
-if rounds_since_update >= 3:
-    results.insert(0, {
-        "type": "text",
-        "text": "<reminder>Refresh your plan before continuing.</reminder>",
-    })
+```rust
+if rounds_since_update >= 3 {
+    results.insert(0, Message::Tool {
+        tool_call_id: "system".to_string(), // 这里可以构造特殊的插入
+        content: "<reminder>Refresh your plan before continuing.</reminder>".to_string(),
+    });
+}
 ```
 
 这一步的核心意义不是“催促”本身，而是：

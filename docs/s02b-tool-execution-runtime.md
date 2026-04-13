@@ -113,10 +113,10 @@ tool_use blocks
 
 教学版最小可以先用这样一个概念：
 
-```python
-batch = {
-    "is_concurrency_safe": True,
-    "blocks": [tool_use_1, tool_use_2, tool_use_3],
+```rust
+pub struct ToolExecutionBatch {
+    pub is_concurrency_safe: bool,
+    pub blocks: Vec<ToolUseBlock>,
 }
 ```
 
@@ -129,15 +129,22 @@ batch = {
 
 如果你准备把执行层做得更稳、更清楚，建议显式跟踪每个工具：
 
-```python
-tracked_tool = {
-    "id": "toolu_01",
-    "name": "read_file",
-    "status": "queued",   # queued / executing / completed / yielded
-    "is_concurrency_safe": True,
-    "pending_progress": [],
-    "results": [],
-    "context_modifiers": [],
+```rust
+pub enum ToolStatus {
+    Queued,
+    Executing,
+    Completed,
+    Yielded,
+}
+
+pub struct TrackedTool {
+    pub id: String,
+    pub name: String,
+    pub status: ToolStatus,
+    pub is_concurrency_safe: bool,
+    pub pending_progress: Vec<ProgressMessage>,
+    pub results: Vec<ToolResultEnvelope>,
+    pub context_modifiers: Vec<ContextModifier>,
 }
 ```
 
@@ -156,10 +163,10 @@ tracked_tool = {
 
 最小可以先理解成：
 
-```python
-update = {
-    "message": maybe_message,
-    "new_context": current_context,
+```rust
+pub struct MessageUpdate {
+    pub message: Option<Message>,
+    pub new_context: ToolUseContext,
 }
 ```
 
@@ -178,54 +185,76 @@ update = {
 
 最小理解方式：
 
-```python
-queued_context_modifiers = {
-    "toolu_01": [modify_ctx_a],
-    "toolu_02": [modify_ctx_b],
-}
+```rust
+// 使用 Hash Map 保存根据 tool_id 排队的 Context Modifiers 
+let mut queued_context_modifiers: HashMap<String, Vec<ContextModifier>> = HashMap::new();
+queued_context_modifiers.insert("toolu_01".to_string(), vec![modify_ctx_a]);
+queued_context_modifiers.insert("toolu_02".to_string(), vec![modify_ctx_b]);
 ```
 
 ## 最小实现
 
 ### 第一步：先分清哪些工具能并发
 
-```python
-def is_concurrency_safe(tool_name: str, tool_input: dict) -> bool:
-    return tool_name in {"read_file", "search_files"}
+```rust
+fn is_concurrency_safe(tool_name: &str, tool_input: &Value) -> bool {
+    // 简化处理，只举例纯只读工具
+    let safe_tools = ["read_file", "search_files"];
+    safe_tools.contains(&tool_name)
+}
 ```
 
 ### 第二步：先分批，再执行
 
-```python
-batches = partition_tool_calls(tool_uses)
+```rust
+let batches = partition_tool_calls(&tool_uses);
 
-for batch in batches:
-    if batch["is_concurrency_safe"]:
-        run_concurrently(batch["blocks"])
-    else:
-        run_serially(batch["blocks"])
+for batch in batches {
+    if batch.is_concurrency_safe {
+        // Rust 可以通过 tokio::spawn 或 futures::future::join_all 真正并发执行
+        run_concurrently(&batch.blocks).await;
+    } else {
+        for block in batch.blocks {
+            run_serially(&block).await;
+        }
+    }
+}
 ```
 
 ### 第三步：并发批次先吐进度，再收最终结果
 
-```python
-for update in run_concurrently(...):
-    if update.get("message"):
-        yield update["message"]
+```rust
+// 通过 tokio 的 mpsc channel 或 Stream 实现异步进度上报
+let mut stream = run_concurrently_stream(...);
+while let Some(update) = stream.next().await {
+    if let Some(msg) = update.message {
+        tx_notify.send(msg).await?; // 替代传统 yield
+    }
+}
 ```
 
 ### 第四步：context modifier 不要乱序落地
 
-```python
-queued_modifiers = {}
+```rust
+let mut queued_modifiers: HashMap<String, Vec<ContextModifier>> = HashMap::new();
 
-for update in concurrent_updates:
-    if update.get("context_modifier"):
-        queued_modifiers[update["tool_id"]].append(update["context_modifier"])
+for update in concurrent_updates {
+    if let Some(modifier) = update.context_modifier {
+        queued_modifiers
+            .entry(update.tool_id.clone())
+            .or_default()
+            .push(modifier);
+    }
+}
 
-for tool in original_batch_order:
-    for modifier in queued_modifiers.get(tool["id"], []):
-        context = modifier(context)
+// 借用原排序，依次重新应用上下文更改，保证脏写安全
+for tool in &original_batch_order {
+    if let Some(modifiers) = queued_modifiers.remove(&tool.id) {
+        for modifier in modifiers {
+            context.apply(modifier);
+        }
+    }
+}
 ```
 
 这一步是整篇里最容易被低估，但其实最接近真实系统开始长出执行运行时的点之一。

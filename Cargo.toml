@@ -21,6 +21,10 @@ path = "agents/s03_todo_write.rs"
 name = "s04"
 path = "agents/s04_subagent.rs"
 
+[[bin]]
+name = "s05"
+path = "agents/s05_skill_loading.rs"
+
 
 # 2. 项目依赖 (Dependencies)
 [dependencies]
@@ -34,3 +38,5 @@ serde_json = "1.0"
 dotenv = "0.15"
 serde = { version = "1.0.228", features = ["derive"] }
 wait-timeout = "0.2"
+thiserror = "2.0"
+walkdir = "2.5"

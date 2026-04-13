@@ -79,26 +79,33 @@ Parent agent continues
 
 最小 schema 可以非常简单：
 
-```python
-{
-    "name": "task",
-    "description": "Run a subtask in a clean context and return a summary.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "prompt": {"type": "string"}
-        },
-        "required": ["prompt"]
+```rust
+// 使用 serde_json 构造：
+json!({
+    "type": "function",
+    "function": {
+        "name": "task",
+        "description": "Run a subtask in a clean context and return a summary.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string"}
+            },
+            "required": ["prompt"]
+        }
     }
-}
+})
 ```
 
 ### 第二步：子智能体使用自己的消息列表
 
-```python
-def run_subagent(prompt: str) -> str:
-    sub_messages = [{"role": "user", "content": prompt}]
-    ...
+```rust
+async fn run_subagent(prompt: &str) -> String {
+    let mut sub_messages = vec![Message::User {
+        content: prompt.to_string(),
+    }];
+    // ...
+}
 ```
 
 这就是隔离的关键。
@@ -120,11 +127,10 @@ def run_subagent(prompt: str) -> str:
 
 子智能体做完事后，不把全部内部历史写回去，而是返回一段总结。
 
-```python
-return {
-    "type": "tool_result",
-    "tool_use_id": block.id,
-    "content": summary_text,
+```rust
+Message::Tool {
+    tool_call_id: tc["id"].as_str().unwrap_or("").to_string(),
+    content: summary_text,
 }
 ```
 
@@ -132,12 +138,13 @@ return {
 
 如果你只记一个结构，就记这个：
 
-```python
-class SubagentContext:
-    messages: list
-    tools: list
-    handlers: dict
-    max_turns: int
+```rust
+pub struct SubagentContext {
+    pub messages: Vec<Message>,
+    pub tools: Vec<serde_json::Value>,
+    pub max_turns: u32,
+    // (handlers 在 Rust 中通常硬编码匹配模式或用 traits)
+}
 ```
 
 解释一下：
@@ -225,9 +232,11 @@ class SubagentContext:
 - 不是从空白 `messages` 开始
 - 而是先复制父智能体的已有上下文，再追加子任务 prompt
 
-```python
-sub_messages = list(parent_messages)
-sub_messages.append({"role": "user", "content": prompt})
+```rust
+let mut sub_messages = parent_messages.clone();
+sub_messages.push(Message::User {
+    content: prompt.to_string(),
+});
 ```
 
 这就是 fork 的本质：

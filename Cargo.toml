@@ -25,6 +25,9 @@ path = "agents/s04_subagent.rs"
 name = "s05"
 path = "agents/s05_skill_loading.rs"
 
+[[bin]]
+name = "s06"
+path = "agents/s06_context_compact.rs"
 
 # 2. 项目依赖 (Dependencies)
 [dependencies]

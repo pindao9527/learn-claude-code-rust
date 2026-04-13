@@ -10,6 +10,130 @@ use std::collections::HashMap;
 use std::fs;
 use thiserror::Error;
 use walkdir::WalkDir;
+use std::future::Future;
+use std::pin::Pin;
+
+// 这里由于 async fn in trait 仍在演进或者考虑到使用泛型对象 Box<dyn Compressor>，
+// 最好返回一个使用 Box 包裹的 Future，这是目前兼容性最好的面向接口异步编程写法（如果不用第三方库）。
+pub trait Compressor {
+  // 我们的压缩可能是“就地修改旧数据”，也可能要返回结果，所以传入 &mut Vec<Message> 可变借用
+  // 返回一个被 Pin 住的基于堆分配的 Future（其实这里我们可以体验纯手写，不引入第三方 async-trait 宏）
+  fn compress<'a>(
+    &'a self,
+    messages: &'a mut Vec<Message>,
+    client: &'a Client,
+    model_id: &'a str
+  ) -> Pin<Box<dyn Future<Output = Result<bool, Box<dyn std::error::Error>>> + 'a>>;
+}
+
+// 我们定义一个结构体，把要保留的近期工具条数变成可配置的
+pub struct MicroCompressor {
+  pub keep_recent: usize,
+}
+
+impl Compressor for MicroCompressor {
+  fn compress<'a>(
+    &'a self,
+    messages: &'a mut Vec<Message>,
+    _client: &'a Client, // 微压缩不需要网络请求，用 _ 忽略
+    _model_id: &'a str
+  ) -> Pin<Box<dyn Future<Output = Result<bool, Box<dyn std::error::Error>>> + 'a>> {
+    Box::pin(async move {
+      let mut tool_count = 0;
+
+      // 巧用 Rust 的双端迭代器，从后往前遍历消息（rev() 将迭代器反转），
+      // 这样最先遇到的 Tool 消息一定是最新的！
+      for msg in messages.iter_mut().rev() {
+        // 如果恰好匹配出 Tool 消息，解构出可变借用的 content
+        if let Message::Tool {content, ..} = msg {
+          tool_count += 1;
+          // 如果发现已经跳过了最新执行的 N 次工具调用
+          if tool_count > self.keep_recent {
+             // 且内容较长，才实行切除术
+             if content.len() > 120 {
+               // 就地点石成金：直接替换这块内存存储的字符串！
+               *content = "[Earlier tool result compacted. Re-run the tool if you need full detail.]".to_string();
+             }
+          }
+        }
+      }
+      // 返回 false 表示：我只做了一点修剪剪裁，并不意味着当前上下文已经被“完全重置”
+      // 允许其他可能的压缩策略继续工作
+      Ok(false)
+    })
+  }
+}
+
+// 我们把配置与请求鉴权独立保存在这个压缩器的状态里！
+pub struct SummaryCompressor {
+  pub max_len: usize,
+  pub api_key: String,
+  pub base_url: String,
+}
+
+impl Compressor for SummaryCompressor {
+  fn compress<'a>(
+    &'a self,
+    messages: &'a mut Vec<Message>,
+    client: &'a Client,
+    model_id: &'a str
+  ) -> Pin<Box<dyn Future<Output = Result<bool, Box<dyn std::error::Error>>> + 'a>> {
+    Box::pin(async move {
+      // 直接通过 JSON 序列化估算文字长度
+      let serialized = serde_json::to_string(messages).unwrap_or_default();
+
+      if serialized.len() < self.max_len {
+        return Ok(false); // 还不到火候，直接放行
+      }
+
+      println!("\n\x1B[35m[Auto Compact触发] 上下文过长({} 字符)，正在呼叫 LLM 浓缩精华...\x1B[0m", serialized.len());
+
+      // 截短一部分防止超长
+      let cut_len = std::cmp::min(80000, serialized.len());
+      let prompt = format!("Summarize this coding-agent conversation so work can continue.\n\
+                 Preserve:\n\
+                 1. The current goal\n\
+                 2. Important findings and decisions\n\
+                 3. Files read or changed\n\
+                 4. Remaining work\n\
+                 Be compact but concrete.\n\n{}", &serialized[..cut_len]);
+      let body = serde_json::json!({
+        "model": model_id,
+        "messages": [{"role":"user", "content": prompt}],
+        "max_tokens": 2000
+      });
+
+      // 以一部全新的网络请求专门获取精华总结
+      let resp = client
+        .post(format!("{}/v1/chat/completions", self.base_url))
+        .header("Authorization", format!("Bearer {}", self.api_key))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await?
+        .json::<serde_json::Value>()
+        .await?;
+
+      let summary = resp["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or("No summary generated.")
+        .to_string();
+
+      // 重点：暴力美学清空原有所有数组！！！
+      messages.clear();
+
+      // 塞入这粒浓缩的知识胶囊作为真正的“最初始”对话
+      messages.push(Message::User {
+        content: format!(
+          "This conversation was compacted so the agent can continue working.\n\n{}",
+          summary
+        )
+      });
+      Ok(true) // 返回 true 告诉后续，这里的记忆已经被“重写”了
+    })
+  }
+}
+
 
 #[derive(Error, Debug)]
 pub enum SkillError {
@@ -105,7 +229,7 @@ impl SkillRegistry {
     let mut body = text.to_string();
 
     if text.starts_with("---\n") {
-      //  找到截断点：寻找下一个 '---' (从第4个字符开始搜，避开开头的)
+      // 找到截断点：寻找下一个 '---' (从第4个字符开始搜，避开开头的)
       if let Some(end_idx) = text[4..].find("---\n") {
         let actual_end_idx = 4 + end_idx;
         let frontmatter = &text[4..actual_end_idx];
@@ -161,7 +285,7 @@ const SUBAGENT_SYSTEM: &str = "You are a coding subagent. Complete the given tas
 // 并把枚举成员名（System/User/Assistant/Tool）作为这个字段的值。
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "role", rename_all = "lowercase")]
-enum Message {
+pub enum Message {
   System { content: String },
   User { content: String },
   Assistant {
@@ -590,12 +714,24 @@ async fn agent_loop(
   system: &str,
   messages: &mut Vec<Message>, // &mut 表示可变引用，允许在循环中修改消息列表
   registry: &SkillRegistry,
+  compressors: &[Box<dyn Compressor>], // 接收类型擦除后的 Trait Object 数组
 ) -> Result<(), Box<dyn std::error::Error>> {
   loop {
-    // 1. 准备消息列表
+    // 1.在每次即将发起模型请求前，挨个过一遍压缩网关
+    for comp in compressors {
+      // 利用动态分发调用实现好的 compress
+      let fully_compacted = comp.compress(messages, client, model_id).await?;
+      if fully_compacted {
+        // 如果 SummaryCompressor 返回了 true，代表历史全清空了，无需后面的压缩器再跑
+        break;
+      }
+    }
+
+
+    // 2. 准备消息列表
     let mut request_messages = vec![json!(Message::System{ content: system.to_string() })];
     
-    // 2. 这里的重点！我们通过 extend(messages) 来加入历史
+    // 3. 这里的重点！我们通过 extend(messages) 来加入历史
     // 因为 Message 实现了 Serialize，json! 会自动处理它
     for msg in messages.iter() {
       request_messages.push(json!(msg));
@@ -609,7 +745,7 @@ async fn agent_loop(
       "max_tokens": 8000
     });
 
-    // 2. 发送请求（OpenAI 协议）
+    // 4. 发送请求（OpenAI 协议）
     let resp = client
         .post(format!("{}/v1/chat/completions", base_url))
         .header("Authorization", format!("Bearer {}", api_key))
@@ -620,7 +756,7 @@ async fn agent_loop(
         .json::<Value>()
         .await?;
 
-    // 3. 解析 OpenAI 响应格式
+    // 5. 解析 OpenAI 响应格式
     let choice = &resp["choices"][0];
     let finish_reason = choice["finish_reason"].as_str().unwrap_or("");
     let assistant_msg = Message::Assistant {
@@ -628,15 +764,15 @@ async fn agent_loop(
       tool_calls: choice["message"]["tool_calls"].as_array().cloned(),
     };
 
-    // 4.注意：这里直接 push 我们刚构造的强类型枚举
+    // 6.注意：这里直接 push 我们刚构造的强类型枚举
     messages.push(assistant_msg);
 
-    // 5. 检查 finish_reason：不是 tool_calls 就跳出循环
+    // 7. 检查 finish_reason：不是 tool_calls 就跳出循环
     if finish_reason != "tool_calls" {
       return Ok(());
     }
 
-    // 6. 遍历 tool_calls，执行命令
+    // 8. 遍历 tool_calls，执行命令
     let mut results: Vec<Message> = vec![]; // 存储Message
     if let Some(tool_calls) = choice["message"]["tool_calls"].as_array() {
       for tc in tool_calls {
@@ -671,7 +807,8 @@ async fn agent_loop(
           "task" => {
             let desc = args["description"].as_str().unwrap_or("subtask");
             let prompt = args["prompt"].as_str().unwrap_or("");
-            println!("\x1B[35m> task ({})：{}\x1B[0m", desc, &prompt[..prompt.len().min(80)]);
+            let safe_prompt: String = prompt.chars().take(80).collect();
+            println!("\x1B[35m> task ({})：{}\x1B[0m", desc, safe_prompt);
             run_subagent(prompt, client, api_key, base_url, model_id, registry).await
           },
           "load_skill" => {
@@ -695,7 +832,7 @@ async fn agent_loop(
       }
     }
 
-    // 7. 把工具结果逐条追加到历史，然后回到 loop 顶部
+    // 9. 把工具结果逐条追加到历史，然后回到 loop 顶部
     messages.extend(results);
   }
 }
@@ -720,14 +857,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   you act.\nSkills available:\n{}", 
   SYSTEM, registry.describe_available());
 
-  println!("\x1B[36mRust s05 >> 已就绪! (使用模型：{})\x1B[0m", model_id);
+  println!("\x1B[36mRust s06 >> 已就绪! (使用模型：{})\x1B[0m", model_id);
 
-  // REPL 主循环
+  // 启动 REPL 主循环前，实例化我们的压缩策略数组：
+  // 这里必须用 Box 裹住不同的类型，否则 Vec 不能允许放大小不一的结构体
+  let mut compressors: Vec<Box<dyn Compressor>> = Vec::new();
+
+  // 1. 微压缩器，只留最后 3 条工具调用
+  compressors.push(Box::new(MicroCompressor { keep_recent: 3}));
+  // 2. 总结压缩器，这里为了快速测试，我把阈值设为比较小的 1000 字符（正常用应设为几万）
+  compressors.push(Box::new(SummaryCompressor {
+    max_len: 80000,
+    api_key: api_key.clone(),
+    base_url: base_url.clone(),
+  }));
+
+  // 然后再进入 loop REPL 循环。
   let mut history: Vec<Message> = vec![];
 
   loop {
     // 1. 打印提示符
-    print!("\x1B[36ms05 >> \x1B[0m");
+    print!("\x1B[36ms06 >> \x1B[0m");
     io::stdout().flush()?; // io::Write 的 flush() 方法用于刷新缓冲区，确保提示符立即显示
     
     // 2. 读取用户输入
@@ -744,7 +894,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     history.push(Message::User { content: query.to_string() });
 
     // 5. 调用 agent_loop 并处理错误
-    if let Err(e) = agent_loop(&client, &api_key, &base_url, &model_id, &system, &mut history, &registry).await {
+    if let Err(e) = agent_loop(&client, &api_key, &base_url, &model_id, &system, &mut history, &registry, &compressors).await {
       eprintln!("Error: {}", e);
     }
 

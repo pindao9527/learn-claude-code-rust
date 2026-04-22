@@ -1,40 +1,85 @@
-# Day 07 复习卡：权限管道与异步阻塞之美
+# Day 07 复习卡：任务系统与文件持久化
 
-## 1. 核心理论：异步并非魔法，而是“状态机”
+## 1. 核心理论：状态在对话之外存活
 
-在 Day 07 我们接触了深入体验 Tokio 与 Async 编程的核心：当我们需要一个等待用户输入的操作时（权限询问的 `ask_user`）。
-在普通同步程序中（使用 `std::io`），线程会被操作系统强行挂起（阻塞）。
-但在 Rust 的 `async { ... }` 块中，`.await` 实际上是将这段代码编译成了一个**枚举状态机（State Machine）**。当遇到 `tokio::io::stdin().read_line(&mut buffer).await`，如果输入没准备好，它返回 `Poll::Pending` 将执行权还给 Tokio 调度器，而不是卡住整颗 CPU。这是构建高并发系统最本质的基石。
+s03 的 `TodoManager` 只活在内存里，上下文压缩一跑就没了。
+s07 的 `TaskManager` 把每个任务写成一个 JSON 文件，重启、压缩都不会丢失。
 
-## 2. 安全不仅是功能，更是类型
+这是一个根本性的转变：**把 Agent 的工作状态从"对话内"移到"文件系统上"**。
 
-在 `PermissionManager` 的管道实现中，我们体会了将结果建模为枚举的好处：
+## 2. serde 派生：让结构体自动会读写 JSON
+
 ```rust
-pub enum PermissionDecision {
-    Allow(String),
-    Deny(String),
-    AskUser(String),
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Task {
+    pub id: u32,
+    pub subject: String,
+    pub status: String,
+    pub blocked_by: Vec<u32>,
+    pub owner: String,
 }
 ```
-通过这种**类型系统层面的强约束**，我们在主循环 `agent_loop` 里写 `match decision` 时，编译器会强制我们穷尽这三种可能性。绝不会因为漏写了 `AskUser` 的逻辑而使代理工具擅自放开危险绿灯。Rust 把安全流转问题转化为了编译期强类型绑定问题！
 
-## 3. Pipeline 的短路（Short-Circuiting）
+`#[derive(...)]` 让编译器自动生成代码：
 
-权限检测的 4 阶段：
-1. **Deny Rules (硬性黑名单拦截)**
-2. **Mode-based (Plan/Auto 等模式快速阻断或放行)**
-3. **Allow Rules (永远放行的白名单)**
-4. **Ask (无匹配项时的兜底挂起并询问)**
+- `Serialize` — 能把 `Task` 转成 JSON 字符串（写文件）
+- `Deserialize` — 能把 JSON 字符串还原成 `Task`（读文件）
+- `Debug` — 能用 `{:?}` 打印
+- `Clone` — 能 `.clone()` 复制
 
-由于 Rust 中表达式和匹配能通过提前 `return`（短路特性），使管道的写法显得异常凌厉。如果在第一关发现了 `sudo` 提权操作，直接返回 `PermissionDecision::Deny`，其余复杂的校验开销完全无需支付。
+不需要手写任何序列化逻辑，编译器全包了。
 
-## 4. 同步与异步世界的边界
+## 3. Option 链式调用：安全解析文件名
 
-许多人在刚进入 Rust 的异步世界时，都会被**函数红蓝着色问题**折磨：无法在一个普通的同步“蓝”函数里随意调用一个“红”的 async 函数，除非你在异步上下文中被 `.await`。
-通过将程序的入口改为 `#[tokio::main]`，并深入理解什么地方该同步（`main` 最初的配置抓取），什么地方该异步（Agent 行走途中的阻断等待），我们正在构建一个结构清爽的事件驱动系统。这让我们为后续引入定时器（Day 14）、并发任务通道（Day 13）打下了坚实的基础。
+从 `"task_3.json"` 中提取数字 `3`，用链式 `and_then`：
+
+```rust
+s.strip_prefix("task_")
+    .and_then(|s| s.strip_suffix(".json"))
+    .and_then(|s| s.parse::<u32>().ok())
+```
+
+任何一步失败（文件名不匹配、解析失败）都会短路返回 `None`，不会 panic。
+这是 Rust 处理"可能失败的多步操作"的惯用法。
+
+## 4. retain：就地过滤 Vec
+
+依赖解除的核心一行：
+
+```rust
+task.blocked_by.retain(|&x| x != completed_id);
+```
+
+`retain` 就地删除不满足条件的元素，等价于 Python 的：
+
+```python
+task["blockedBy"] = [x for x in task["blockedBy"] if x != completed_id]
+```
+
+区别是 Rust 不分配新内存，直接在原 `Vec` 上操作。
+
+## 5. &mut self vs &self
+
+今天遇到了两种方法签名：
+
+- `fn create(&mut self, ...)` — 需要修改 `next_id`，必须可变借用
+- `fn load(&self, ...)` — 只读，不可变借用就够了
+- `fn save(&self, ...)` — 只写文件，不修改结构体字段，不可变借用
+
+Rust 编译器会在你写错时报错，这是所有权系统保护你不犯错的方式。
+
+## 6. map_err：错误类型转换
+
+```rust
+std::fs::read_to_string(&path)
+    .map_err(|_| format!("Task {} not found", task_id))?;
+```
+
+`read_to_string` 返回 `io::Error`，但我们的函数返回 `String` 错误。
+`map_err` 把错误类型转换，`?` 再把错误提前返回。
 
 ---
 
-### 💡 第七天心得
+### 今天的收获
 
-权限控制不只是一个拦截外部破坏的门禁，它是教会我们“如何安全地挂起与等待”的第一节实战课。当你习惯用枚举表达不同阶段的检测结果、并用 `async` 优雅地让出系统的 IO 能力，你的代码不仅仅是安全，更散发出系统级工业程序的严谨与从容。
+文件 I/O 在 Rust 里比想象中简单——`serde` 处理序列化，`std::fs` 处理读写，`PathBuf::join` 处理路径拼接。真正需要思考的是**错误处理**：每一步都可能失败，Rust 强迫你把每种失败都想清楚。

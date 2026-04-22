@@ -12,184 +12,6 @@ use thiserror::Error;
 use walkdir::WalkDir;
 use std::future::Future;
 use std::pin::Pin;
-use tokio::io::{AsyncBufReadExt, BufReader};
-
-// 1. 代理当前的工作模式
-#[derive(Debug, Clone, PartialEq)]
-pub enum PermissionMode {
-  Default, // 默认模式：未知的写操作倾向于询问
-  Plan, // 计划/规划模式：完全禁止写操作，只能读
-  Auto, // 自动模式：读写都放开（除非触发高危命令规则才询问）
-}
-
-// 2. 规则本身携带的倾向行为
-#[derive(Debug, Clone, PartialEq)]
-pub enum PermissionBehavior {
-  Allow,
-  Deny,
-  Ask,
-}
-
-// 3. 内存里的单条安全规则
-// (例如: { tool: "bash", content: "rm -rf*", behavior: Deny })
-#[derive(Debug, Clone)]
-pub struct PermissionRule {
-  pub tool_pattern: String, // "*" 表示匹配所有工具
-  pub path_pattern: String, // "*" 表示匹配所有路径
-  pub content_pattern: String, // 仅仅给 bash / write 使用的内容鉴权
-  pub behavior: PermissionBehavior,
-}
-
-// 4. 流水线 (Pipeline) 跑完后返回给主循环的“最终裁决词”
-pub enum PermissionDecision {
-  Allow(String), // 例如：Allow("匹配到白名单")
-  Deny(String), // 例如：Deny("拦截危险提权")
-  AskUser(String), // 例如：AskUser("未知的写文件请求")
-}
-
-
-pub struct PermissionManager {
-  pub mode: PermissionMode,
-  pub rules: Vec<PermissionRule>,
-  pub consecutive_denials: usize,
-  pub max_consecutive_denials: usize,
-}
-
-impl PermissionManager {
-  pub fn new(mode: PermissionMode) -> Self {
-    Self {
-      mode,
-      rules: vec![
-        // 默认内置一条黑名单防提权和全盘删除 (作为演示体验)
-        PermissionRule {
-          tool_pattern: "bash".to_string(),
-          path_pattern: "*".to_string(),
-          content_pattern: "sudo".to_string(),
-          behavior: PermissionBehavior::Deny,
-        },
-        PermissionRule {
-          tool_pattern: "bash".to_string(),
-          path_pattern: "*".to_string(),
-          content_pattern: "rm -rf".to_string(),
-          behavior: PermissionBehavior::Deny,
-        },
-      ],
-      consecutive_denials: 0,
-      max_consecutive_denials: 3,
-    }
-  }
-
-  // ⭐ 核心管道：每次工具执行前的关卡大考
-  pub fn check(&mut self, tool_name: &str, tool_input: &Value) -> PermissionDecision {
-    // 第一关： 系统内置硬件拒绝法则（Deny Rules）
-    for rule in &self.rules {
-      if rule.behavior == PermissionBehavior::Deny 
-      && Self::is_match(rule, tool_name, tool_input) {
-        return PermissionDecision::Deny(format!("命中黑名单规则: 拦截 ({})", rule.content_pattern));
-      }
-    }
-
-    // 第二关：根据我们传入的模式 (Mode) 进行“一刀切”
-    match self.mode {
-      PermissionMode::Plan => {
-        // 计划模式：写/修改文件/bash通通不让过，只能看代码
-        let write_tools = ["write_file", "edit_file", "bash"];
-        if write_tools.contains(&tool_name) {
-          return PermissionDecision::Deny("计划专属模式（Plan）已锁定，禁止一切修改命令".to_string());
-        }
-        return PermissionDecision::Allow("计划模式：只读放行".to_string());
-      }
-      PermissionMode::Auto => {
-        // 全自动模式：只读必然放行，但高危操作 (bash) 还是要走后面的判定
-        let read_tools = ["read_file"];
-        if read_tools.contains(&tool_name) {
-          return PermissionDecision::Allow("自动模式：只读放行".to_string());
-        }
-      }
-      PermissionMode::Default => {} // 默认就放着，继续走后续审查
-    }
-
-    // 第三关：如果你大发慈悲把它设为了 Always Allow (Allow Rules)
-    for rule in &self.rules {
-      if rule.behavior == PermissionBehavior::Allow && Self::is_match(rule, tool_name, tool_input) {
-        self.consecutive_denials = 0; // 原谅此前的受挫
-        return PermissionDecision::Allow("匹配到白名单规则！".to_string());
-      }
-    }
-
-    // 第四关：兜底条款，一切不决全抛给人类！(Ask)
-    PermissionDecision::AskUser(format!("没有规则兜住 {} 操作，需要进行人工授权", tool_name))
-  }
-
-  // (内部辅助：一个极简的通配规则匹配，不引第三方正则，坚持 KISS)
-  fn is_match(rule: &PermissionRule, tool_name: &str, tool_input: &Value) -> bool {
-    // 1. 先卡 Tool 名字
-    if rule.tool_pattern != "*" && rule.tool_pattern != tool_name {
-      return false;
-    }
-
-    // 2. 假设是 bash 这里找 command 字段，其他找 path 字段
-    let content_to_check = if tool_name == "bash" {
-      tool_input.get("command").and_then(|v| v.as_str()).unwrap_or("")
-    } else {
-      tool_input.get("path").and_then(|v| v.as_str()).unwrap_or("")
-    };
-
-    // 3.看是否命中了拦截或放行关键字
-    if rule.content_pattern != "*" && !content_to_check.contains(&rule.content_pattern) {
-      return false;
-    }
-
-    true
-  }
-
-  // ⭐ 最终关卡：异步的终端等待 (The Magic of .await)
-  // 注意这里使用了 async 关键字
-  pub async fn ask_user(&mut self, tool_name: &str, tool_input: &Value) -> bool {
-    let preview = serde_json::to_string(tool_input).unwrap_or_default();
-    let preview_cut = if preview.len() > 200 { &preview[..200] } else { &preview };
-
-    // 红色高亮打印，提醒人类授权
-    println!("\n\x1B[31m [Permission Request]\x1B[0m {}: {}", tool_name, preview_cut);
-    print!(" Allow? (y/n/always):");
-
-    // Rust 的标准输出是带缓冲的，我们需要显式 flush，否则“Allow?”不一定会立刻显示出来
-    std::io::Write::flush(&mut std::io::stdout()).unwrap();
-
-    // 核心：使用 Tokio 异步读取终端输入！它会自动让出 CPU 给其他任务
-    let stdin = tokio::io::stdin();
-    let mut reader = BufReader::new(stdin);
-    let mut buffer = String::new();
-
-    // .await 将代码转化为状态机，这里悬停，直到用户敲下回车
-    if let Ok(_) = reader.read_line(&mut buffer).await {
-      let answer = buffer.trim().to_lowercase();
-
-      if answer == "always" {
-        // 白名单动态增加一条“免死金牌”
-        self.rules.push(PermissionRule {
-          tool_pattern: tool_name.to_string(),
-          path_pattern: "*".to_string(),
-          content_pattern: "*".to_string(),
-          behavior: PermissionBehavior::Allow,
-        });
-        self.consecutive_denials = 0;
-        return true;
-      } else if answer == "y" || answer == "yes" {
-        self.consecutive_denials = 0;
-        return true;
-      }
-    }
-
-    // 追踪无情的拒绝历史
-    self.consecutive_denials += 1;
-    if self.consecutive_denials >= self.max_consecutive_denials {
-      println!(" [安全小贴士：你已经连续 {} 次拒绝，要不考虑重启将我切换至 Plan (计划)只读模式？]", self.consecutive_denials);
-    }
-
-    false
-  }
-}
 
 // 这里由于 async fn in trait 仍在演进或者考虑到使用泛型对象 Box<dyn Compressor>，
 // 最好返回一个使用 Box 包裹的 Future，这是目前兼容性最好的面向接口异步编程写法（如果不用第三方库）。
@@ -457,6 +279,179 @@ impl SkillRegistry {
 
 const SYSTEM: &str = "ou are a coding agent. Use the task tool to delegate exploration or subtasks.";
 const SUBAGENT_SYSTEM: &str = "You are a coding subagent. Complete the given task, then summarize your findings.";
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Task {
+  pub id: u32,
+  pub subject: String,
+  pub description: String,
+  pub status: String,
+  pub blocked_by: Vec<u32>,
+  pub owner: String,
+}
+
+pub struct TaskManager {
+  pub dir: PathBuf,
+  next_id: u32,
+}
+
+impl TaskManager {
+  pub fn new(dir: PathBuf) -> Self {
+    std::fs::create_dir_all(&dir).ok();
+    let next_id = Self::max_id(&dir) + 1;
+    Self { dir, next_id }
+  }
+
+  fn max_id(dir: &PathBuf) -> u32 {
+    // 遍历 dir 下所有 task_N.json，提取最大的 N
+    let mut max = 0u32;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+      for entry in entries.flatten() {
+        let name = entry.file_name();
+        let s = name.to_string_lossy();
+        // s 长这样："task_3.json"
+        // 你来填：从 s 中提取数字，更新 max
+        if let Some(n) = s.strip_prefix("task_")
+        .and_then(|s| s.strip_suffix(".json"))
+        .and_then(|s| s.parse::<u32>().ok()) {
+          if n > max { max = n; }
+        }
+      }
+    }
+    max
+  }
+
+  fn load(&self, task_id: u32) -> Result<Task, String> {
+    let path = self.dir.join(format!("task_{}.json", task_id));
+    let content = std::fs::read_to_string(&path)
+      .map_err(|_| format!("Task {} not found", task_id))?;
+    serde_json::from_str(&content)
+      .map_err(|e| format!("Parse error: {}", e))
+  }
+
+  fn save(&self, task: &Task) -> Result<(), String> {
+    let path = self.dir.join(format!("task_{}.json", task.id));
+    let json = serde_json::to_string_pretty(task)
+      .map_err(|e| format!("Serialize error: {}", e))?;
+    std::fs::write(&path,json)
+      .map_err(|e| format!("Write error: {}", e))
+  }
+
+  pub fn create(&mut self, subject: String, description: String) -> String {
+    let task = Task {
+      id: self.next_id,
+      subject,
+      description,
+      status: "pending".to_string(),
+      blocked_by: vec![],
+      owner: String::new(),
+    };
+    // 1. 调用 self.save(&task)，忽略错误用 .ok()
+    // 2. self.next_id += 1
+    // 3. 把 task 序列化成 JSON 字符串返回
+    //    用 serde_json::to_string_pretty(&task).unwrap_or_default()
+    self.save(&task).ok();
+    self.next_id += 1;
+    serde_json::to_string_pretty(&task).unwrap_or_default()
+  }
+
+  pub fn list_all(&self) -> String {
+    let mut tasks: Vec<Task> = vec![];
+    if let Ok(entries) = std::fs::read_dir(&self.dir) {
+      let mut ids: Vec<u32> = entries
+        .flatten()
+        .filter_map(|e| {
+          let name = e.file_name();
+          let s = name.to_string_lossy();
+          s.strip_prefix("task_")
+            .and_then(|s| s.strip_suffix(".json"))
+            .and_then(|s| s.parse::<u32>().ok())
+        })
+        .collect();
+      ids.sort();
+      for id in ids {
+        if let Ok(task) = self.load(id) {
+          tasks.push(task);
+        }
+      }
+    }
+    if tasks.is_empty() {
+      return "No tasks.".to_string();
+    }
+    // 把 tasks 格式化成字符串
+    // 参考 Python：
+    // [ ] #1: subject (blocked by: [2])
+    // [>] #2: subject
+    // [x] #3: subject
+    tasks.iter().map(|t| {
+      let marker = match t.status.as_str() { 
+        "pending" => "[ ]",
+        "in_progress" => "[>]",
+        "completed" => "[x]",
+        _ => "[?]"
+      };
+      let blocked = if t.blocked_by.is_empty() {
+        String::new()
+      } else {
+        format!(" (blocked by: {:?})", t.blocked_by)
+      };
+      format!("{} #{}: {}{}", marker, t.id, t.subject, blocked)
+    }).collect::<Vec<_>>().join("\n")
+  }
+
+  pub fn get(&self, task_id: u32) -> String {
+    match self.load(task_id) {
+      Ok(task) => serde_json::to_string_pretty(&task)
+      .unwrap_or_default(),
+      Err(e) => format!("Error: {}", e),
+    }
+  }
+  
+
+  pub fn update(&mut self, task_id: u32, status: Option<String>) -> String {
+    let mut task = match self.load(task_id) {
+      Ok(t) => t,
+      Err(e) => return format!("Error: {}", e),
+    };
+    if let Some(s) = status {
+      // 验证 status 合法
+      if !["pending", "in_progress", "completed"].contains(&s.as_str()) {
+        return format!("Error: Invalid status: {}", s);
+      }
+      task.status = s.clone();
+      if s == "completed" {
+        self.clear_dependency(task_id);
+      }
+    }
+    self.save(&task).ok();
+    serde_json::to_string_pretty(&task).unwrap_or_default()
+  }
+
+  fn clear_dependency(&self, completed_id: u32) {
+     // 遍历所有任务，从 blocked_by 中移除 completed_id
+    // 提示：用 list_all 里类似的遍历方式，load 每个任务，修改后 save 回去
+    if let Ok(entries) = std::fs::read_dir(&self.dir) {
+      let ids: Vec<u32> = entries
+        .flatten()
+        .filter_map(|e| {
+          let name = e.file_name();
+          let s = name.to_string_lossy();
+          s.strip_prefix("task_")
+            .and_then(|s| s.strip_suffix(".json"))
+            .and_then(|s| s.parse::<u32>().ok())
+        })
+        .collect();
+      for id in ids {
+        if let Ok(mut task) = self.load(id) {
+          if task.blocked_by.contains(&completed_id) {
+            task.blocked_by.retain(|&x| x != completed_id);
+            self.save(&task).ok();
+          }
+        }
+      }
+    }
+  }
+}
 
 // #[serde(tag = "role")] 是 Rust 枚举的序列化/反序列化宏
 // 它告诉 serde：序列化时，在 JSON 对象里加一个 key 为 "role" 的字段，
@@ -881,6 +876,56 @@ fn parent_tools() -> Value {
         }
       }
     },
+    {
+      "type": "function",
+      "function": {
+        "name": "task_create",
+        "description": "Create a new task.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "subject": {"type": "string"},
+            "description": {"type": "string"}
+          },
+          "required": ["subject"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "task_list",
+        "description": "List all tasks with status.",
+        "parameters": {"type": "object", "properties": {}}
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "task_get",
+        "description": "Get full details of a task by ID.",
+        "parameters": {
+          "type": "object",
+          "properties": {"task_id": {"type": "integer"}},
+          "required": ["task_id"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "task_update",
+        "description": "Update a task status.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+              "task_id": {"type": "integer"},
+              "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}
+          },
+          "required": ["task_id"]
+        }
+      }
+    },
   ])
 }
 
@@ -893,7 +938,7 @@ async fn agent_loop(
   messages: &mut Vec<Message>, // &mut 表示可变引用，允许在循环中修改消息列表
   registry: &SkillRegistry,
   compressors: &[Box<dyn Compressor>], // 接收类型擦除后的 Trait Object 数组
-  perms: &mut PermissionManager,
+  tasks: &mut TaskManager,
 ) -> Result<(), Box<dyn std::error::Error>> {
   loop {
     // 1.在每次即将发起模型请求前，挨个过一遍压缩网关
@@ -962,41 +1007,27 @@ async fn agent_loop(
         // 打印工具名称
         println!("\x1B[33m[Tool: {}]\x1B[0m", tool_name);
 
-        // [✨ 新关卡：进入权限裁判庭裁判！]
-        let decision = perms.check(tool_name, &args);
-
-        // 我们用一个 bool 追踪裁决结果
-        let mut is_allowed = false;
-        match decision {
-          PermissionDecision::Deny(reason) => {
-            println!(" \x1B[31m[DENIED]\x1B[0m: {}", reason);
-          }
-          PermissionDecision::Allow(reason) => {
-            println!(" \x1B[32m[AllOWED]\x1B[0m: {}", reason);
-            is_allowed = true; // 直接亮绿灯
-          }
-          PermissionDecision::AskUser(_) => {
-            // 这个 await 会让当前任务温和地挂起，等我们人类敲回车拯救世界
-            if perms.ask_user(tool_name, &args).await {
-              is_allowed = true;
-            } else {
-              println!(" \x1B[31m[USER DENIED]\x1B[0m");
-            }
-          }
-        }
-
-        // [✨ 执行结果]
-        let output = if !is_allowed {
-          // 如果没拿到通行证，不要崩溃，把红牌结果直接输出给 LLM，它自己会道歉或换方案
-          "Permission denied: Action blocked by security pipeline or user.".to_string()
-        } else {
-          // 这里就是你原来老代码里的 match tool_name 执行逻辑！
-          // 把原版的 run_bash / run_read... 整体放在这里面
-          match tool_name {
-            "bash" => run_bash(args["command"].as_str().unwrap_or("")),
-          "read_file" => run_read(args["path"].as_str().unwrap_or("")),
-          "write_file" => run_write(args["path"].as_str().unwrap_or(""), args["content"].as_str().unwrap_or("")),
-          "edit_file" => run_edit(args["path"].as_str().unwrap_or(""), args["old_text"].as_str().unwrap_or(""), args["new_text"].as_str().unwrap_or("")),
+        // 核心工具执行逻辑
+        let output = match tool_name {
+          "bash" => {
+            let command = args["command"].as_str().unwrap_or("");
+            run_bash(command)
+          },
+          "read_file" => {
+            let path = args["path"].as_str().unwrap_or("");
+            run_read(path) // 调用读文件函数
+          },
+          "write_file" => {
+            let path = args["path"].as_str().unwrap_or("");
+            let content = args["content"].as_str().unwrap_or("");
+            run_write(path, content)
+          },
+          "edit_file" => {
+            let path = args["path"].as_str().unwrap_or("");
+            let old_text = args["old_text"].as_str().unwrap_or("");
+            let new_text = args["new_text"].as_str().unwrap_or("");
+            run_edit(path, old_text, new_text)
+          },
           "task" => {
             let desc = args["description"].as_str().unwrap_or("subtask");
             let prompt = args["prompt"].as_str().unwrap_or("");
@@ -1004,12 +1035,29 @@ async fn agent_loop(
             println!("\x1B[35m> task ({})：{}\x1B[0m", desc, safe_prompt);
             run_subagent(prompt, client, api_key, base_url, model_id, registry).await
           },
-          "load_skill" => match registry.load_full_text(args["name"].as_str().unwrap_or("")) {
-            Ok(text) => text,
-            Err(e) => format!("Error: {}", e)
+          "load_skill" => {
+            let name = args["name"].as_str().unwrap_or("");
+            match registry.load_full_text(name) {
+              Ok(text) => text,
+              Err(e) => format!("Error: {}", e)
+            }
+          },
+          "task_create" => {
+            let subject = args["subject"].as_str().unwrap_or("").to_string();
+            let desc = args["description"].as_str().unwrap_or("").to_string();
+            tasks.create(subject, desc)
+          },
+          "task_list" => tasks.list_all(),
+          "task_get" => {
+            let id = args["task_id"].as_u64().unwrap_or(0) as u32;
+            tasks.get(id)
+          },
+          "task_update" => {
+            let id = args["task_id"].as_u64().unwrap_or(0) as u32;
+            let status = args["status"].as_str().map(|s| s.to_string());
+            tasks.update(id, status)
           },
           _ => format!("Unknow tool: {}", tool_name),
-          }
         };
 
         println!("{}", &output[..output.len().min(200)]);
@@ -1041,6 +1089,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   let client = Client::new();
   let skills_dir = env::current_dir()?.join("skills");
   let registry = SkillRegistry::new(skills_dir);
+  let tasks_dir = env::current_dir()?.join(".tasks");
+  let mut tasks = TaskManager::new(tasks_dir);
 
   // 将静态 prompt 与动态读取到的“小抄（可用技能清单）”进行拼装
   let system = format!("{}\n\nUse load_skill when a task needs 
@@ -1062,24 +1112,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     api_key: api_key.clone(),
     base_url: base_url.clone(),
   }));
-
-  // 1. 用标准的同步 IO 询问并读取配置
-  print!("请选择权限安全模式 (default / plan / auto) [默认 default]:");
-  std::io::Write::flush(&mut std::io::stdout()).unwrap();
-
-  let mut mode_str = String::new();
-  std::io::stdin().read_line(&mut mode_str).unwrap();
-
-  // 2. 模式匹配：把一坨字符串转化为刚才我们定好的坚固枚举类型
-  let mode = match mode_str.trim().to_lowercase().as_str() {
-    "plan" => PermissionMode::Plan,
-    "auto" => PermissionMode::Auto,
-    _ => PermissionMode::Default,
-  };
-  println!("\n\x1B[32m[系统已切换至 {:?} 模式]\x1B[0m\n", mode);
-
-  // 3. 初始化拥有生杀大权的管道主控实例
-  let mut perms = PermissionManager::new(mode);
 
   // 然后再进入 loop REPL 循环。
   let mut history: Vec<Message> = vec![];
@@ -1103,7 +1135,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     history.push(Message::User { content: query.to_string() });
 
     // 5. 调用 agent_loop 并处理错误
-    if let Err(e) = agent_loop(&client, &api_key, &base_url, &model_id, &system, &mut history, &registry, &compressors, &mut perms).await {
+    if let Err(e) = agent_loop(&client, &api_key, &base_url, &model_id, &system, &mut history, &registry, &compressors, &mut tasks).await {
       eprintln!("Error: {}", e);
     }
 

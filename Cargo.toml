@@ -33,6 +33,10 @@ path = "agents/s06_context_compact.rs"
 name = "s07"
 path = "agents/s07_task_system.rs"
 
+[[bin]]
+name = "s08"
+path = "agents/s08_background_tasks.rs"
+
 # 2. 项目依赖 (Dependencies)
 [dependencies]
 # 异步运行时，提供 #[tokio::main] 和异步执行环境

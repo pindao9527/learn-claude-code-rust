@@ -37,6 +37,10 @@ path = "agents/s07_task_system.rs"
 name = "s08"
 path = "agents/s08_background_tasks.rs"
 
+[[bin]]
+name = "s09"
+path = "agents/s09_agent_teams.rs"
+
 # 2. 项目依赖 (Dependencies)
 [dependencies]
 # 异步运行时，提供 #[tokio::main] 和异步执行环境
@@ -51,3 +55,4 @@ serde = { version = "1.0.228", features = ["derive"] }
 wait-timeout = "0.2"
 thiserror = "2.0"
 walkdir = "2.5"
+fs2 = "0.4.3"

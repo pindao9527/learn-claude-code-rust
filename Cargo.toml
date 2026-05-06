@@ -41,6 +41,10 @@ path = "agents/s08_background_tasks.rs"
 name = "s09"
 path = "agents/s09_agent_teams.rs"
 
+[[bin]]
+name = "s10"
+path = "agents/s10_team_protocols.rs"
+
 # 2. 项目依赖 (Dependencies)
 [dependencies]
 # 异步运行时，提供 #[tokio::main] 和异步执行环境
@@ -56,3 +60,4 @@ wait-timeout = "0.2"
 thiserror = "2.0"
 walkdir = "2.5"
 fs2 = "0.4.3"
+uuid = { version = "1", features = ["v4"] }

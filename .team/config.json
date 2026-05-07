@@ -1,4 +1,35 @@
 {
   "team_name": "default",
-  "members": []
+  "members": [
+    {
+      "name": "alice",
+      "role": "worker",
+      "status": "shutdown"
+    },
+    {
+      "name": "bob",
+      "role": "worker",
+      "status": "shutdown"
+    },
+    {
+      "name": "coder",
+      "role": "coder",
+      "status": "shutdown"
+    },
+    {
+      "name": "worker1",
+      "role": "worker",
+      "status": "idle"
+    },
+    {
+      "name": "worker2",
+      "role": "worker",
+      "status": "idle"
+    },
+    {
+      "name": "worker3",
+      "role": "worker",
+      "status": "idle"
+    }
+  ]
 }

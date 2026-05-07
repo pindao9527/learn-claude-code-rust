@@ -1,0 +1,8 @@
+{
+  "id": 4,
+  "subject": "Test feature",
+  "description": "Test feature after implementation is done",
+  "status": "open",
+  "blocked_by": [3],
+  "owner": ""
+}

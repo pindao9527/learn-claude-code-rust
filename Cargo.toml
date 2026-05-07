@@ -45,6 +45,10 @@ path = "agents/s09_agent_teams.rs"
 name = "s10"
 path = "agents/s10_team_protocols.rs"
 
+[[bin]]
+name = "s11"
+path = "agents/s11_autonomous_agents.rs"
+
 # 2. 项目依赖 (Dependencies)
 [dependencies]
 # 异步运行时，提供 #[tokio::main] 和异步执行环境

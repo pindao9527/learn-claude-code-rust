@@ -1,8 +1,10 @@
 {
-  "id": 1,
-  "subject": "检查桌面文件数量",
-  "description": "统计桌面目录中的文件数量",
-  "status": "completed",
   "blocked_by": [],
-  "owner": ""
+  "description": "统计桌面目录中的文件数量",
+  "id": 1,
+  "owner": "",
+  "status": "completed",
+  "subject": "检查桌面文件数量",
+  "updated_at": 1779095708,
+  "worktree": ""
 }

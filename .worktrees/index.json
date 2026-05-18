@@ -1,0 +1,13 @@
+{
+  "worktrees": [
+    {
+      "branch": "wt/auth-refactor",
+      "created_at": 1779095684,
+      "name": "auth-refactor",
+      "path": "/Users/yc/shl/learn-claude/learn-claude-code-rust/.worktrees/auth-refactor",
+      "removed_at": 1779095708,
+      "status": "removed",
+      "task_id": 1
+    }
+  ]
+}

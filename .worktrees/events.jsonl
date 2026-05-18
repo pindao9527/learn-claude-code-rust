@@ -1,0 +1,5 @@
+{"event":"worktree.create.before","task":{"id":1},"ts":1779095684,"worktree":{"base_ref":"HEAD","name":"auth-refactor"}}
+{"event":"worktree.create.after","task":{"id":1},"ts":1779095684,"worktree":{"branch":"wt/auth-refactor","name":"auth-refactor","status":"active"}}
+{"event":"worktree.remove.before","task":{"id":1},"ts":1779095708,"worktree":{"name":"auth-refactor","path":"/Users/yc/shl/learn-claude/learn-claude-code-rust/.worktrees/auth-refactor"}}
+{"event":"task.completed","task":{"id":1,"status":"completed","subject":"{\n  \"blocked_by\": [],\n  \"description\": \"统计桌面目录中的文件数量\",\n  \"id\": 1,\n  \"owner\": \"\",\n  \"status\": \"completed\",\n  \"subject\": \"检查桌面文件数量\",\n  \"updated_at\": 1779095684,\n  \"worktree\": \"auth-refactor\"\n}"},"ts":1779095708,"worktree":{"name":"auth-refactor"}}
+{"event":"worktree.remove.after","task":{"id":1},"ts":1779095708,"worktree":{"name":"auth-refactor","status":"removed"}}
